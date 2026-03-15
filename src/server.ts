@@ -79,6 +79,20 @@ function createPool() {
   });
 }
 
+function quoteSqlIdentifier(identifier: string, label: string): string {
+  const trimmed = identifier.trim();
+
+  if (!trimmed) {
+    throw new Error(`${label} is required.`);
+  }
+
+  if (trimmed.includes("\u0000")) {
+    throw new Error(`${label} contains invalid characters.`);
+  }
+
+  return `[${trimmed.replaceAll("]", "]]")}]`;
+}
+
 function parseTableReference(
   tableReference: string,
   schema?: string
@@ -96,6 +110,10 @@ function parseTableReference(
 
   if (segments.length === 0 || segments.length > 2) {
     throw new Error("Use `table` or `schema.table` format.");
+  }
+
+  if (segments.length === 2 && schema?.trim()) {
+    throw new Error("Provide either `schema` or `schema.table`, not both.");
   }
 
   const schemaName =
@@ -146,7 +164,7 @@ async function main(): Promise<void> {
   const server = new McpServer(
     {
       name: "mssql-mcp-server",
-      version: "1.1.0"
+      version: "1.2.0"
     },
     {
       capabilities: {
@@ -156,19 +174,23 @@ async function main(): Promise<void> {
   );
 
   server.registerTool(
-    "list_tables",
+    "list_databases",
     {
-      description: "List base tables grouped by schema.",
+      description: "List databases available on the SQL Server instance.",
       annotations: {
         readOnlyHint: true
       }
     },
     async () => {
       const result = await pool.request().query(`
-        SELECT TABLE_SCHEMA, TABLE_NAME
-        FROM INFORMATION_SCHEMA.TABLES
-        WHERE TABLE_TYPE = 'BASE TABLE'
-        ORDER BY TABLE_SCHEMA, TABLE_NAME
+        SELECT
+          name,
+          database_id,
+          create_date,
+          compatibility_level,
+          state_desc
+        FROM sys.databases
+        ORDER BY name
       `);
 
       return {
@@ -183,10 +205,54 @@ async function main(): Promise<void> {
   );
 
   server.registerTool(
+    "list_tables",
+    {
+      description: "List base tables in the selected database, optionally filtered by schema.",
+      inputSchema: {
+        database: z.string().min(1).describe("Database name"),
+        schema: z.string().min(1).optional().describe("Optional schema filter")
+      },
+      annotations: {
+        readOnlyHint: true
+      }
+    },
+    async ({ database, schema }) => {
+      const databaseName = quoteSqlIdentifier(database, "Database name");
+      const result = await pool
+        .request()
+        .input("schema", sql.NVarChar, schema?.trim() || null)
+        .query(`
+          SELECT
+            TABLE_CATALOG,
+            TABLE_SCHEMA,
+            TABLE_NAME
+          FROM ${databaseName}.INFORMATION_SCHEMA.TABLES
+          WHERE TABLE_TYPE = 'BASE TABLE'
+            AND (@schema IS NULL OR TABLE_SCHEMA = @schema)
+          ORDER BY TABLE_SCHEMA, TABLE_NAME
+        `);
+
+      return {
+        content: [
+          {
+            type: "text",
+            text: formatRecordset({
+              database: database.trim(),
+              schema: schema?.trim() || null,
+              tables: result.recordset
+            })
+          }
+        ]
+      };
+    }
+  );
+
+  server.registerTool(
     "describe_table",
     {
-      description: "Describe a table's columns. Accepts `table` or `schema.table`.",
+      description: "Describe a table in a selected database.",
       inputSchema: {
+        database: z.string().min(1).describe("Database name"),
         table: z.string().min(1).describe("Table name or schema-qualified table name"),
         schema: z.string().min(1).optional().describe("Optional schema when `table` is not qualified")
       },
@@ -194,7 +260,8 @@ async function main(): Promise<void> {
         readOnlyHint: true
       }
     },
-    async ({ table, schema }) => {
+    async ({ database, table, schema }) => {
+      const databaseName = quoteSqlIdentifier(database, "Database name");
       const { schemaName, tableName } = parseTableReference(table, schema);
       const result = await pool
         .request()
@@ -202,20 +269,23 @@ async function main(): Promise<void> {
         .input("table", sql.NVarChar, tableName)
         .query(`
           SELECT
+            TABLE_CATALOG,
+            TABLE_SCHEMA,
+            TABLE_NAME,
             COLUMN_NAME,
             DATA_TYPE,
             IS_NULLABLE,
             CHARACTER_MAXIMUM_LENGTH,
             NUMERIC_PRECISION,
             NUMERIC_SCALE
-          FROM INFORMATION_SCHEMA.COLUMNS
+          FROM ${databaseName}.INFORMATION_SCHEMA.COLUMNS
           WHERE TABLE_SCHEMA = @schema
             AND TABLE_NAME = @table
           ORDER BY ORDINAL_POSITION
         `);
 
       if (result.recordset.length === 0) {
-        throw new Error(`Table not found: ${schemaName}.${tableName}`);
+        throw new Error(`Table not found: ${database.trim()}.${schemaName}.${tableName}`);
       }
 
       return {
@@ -223,6 +293,7 @@ async function main(): Promise<void> {
           {
             type: "text",
             text: formatRecordset({
+              database: database.trim(),
               schema: schemaName,
               table: tableName,
               columns: result.recordset
