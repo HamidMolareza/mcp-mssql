@@ -27,7 +27,7 @@ type ConnectionTarget = {
 };
 
 type TargetConfigFile = {
-  defaultTarget?: string;
+  defaultTarget?: string | null;
   targets: ConnectionTarget[];
 };
 
@@ -127,13 +127,14 @@ function loadTargets(): TargetConfigFile {
     }
 
     if (
-      parsed.defaultTarget &&
+      parsed.defaultTarget !== undefined &&
+      parsed.defaultTarget !== null &&
       !targets.some((target) => target.name === parsed.defaultTarget)
     ) {
       throw new Error(`Unknown defaultTarget: ${parsed.defaultTarget}`);
     }
 
-    return parsed.defaultTarget
+    return parsed.defaultTarget !== undefined
       ? {
           defaultTarget: parsed.defaultTarget,
           targets
@@ -275,7 +276,10 @@ function formatRecordset(recordset: unknown): string {
   return JSON.stringify(recordset, null, 2);
 }
 
-function buildInstructions(targets: ConnectionTarget[], defaultTarget?: string): string {
+function buildInstructions(
+  targets: ConnectionTarget[],
+  defaultTarget?: string | null
+): string {
   const lines = [
     "Use the SQL Server tools with the `target` argument to choose the correct server.",
     "If the task does not specify a target, choose based on the descriptions below."
