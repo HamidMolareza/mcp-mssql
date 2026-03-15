@@ -3,4 +3,5 @@ node_modules
 .idea
 .env
 dist
+logs
 mssql-targets.json

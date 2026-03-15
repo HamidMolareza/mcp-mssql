@@ -1,5 +1,6 @@
-import { existsSync, readFileSync } from "node:fs";
-import { resolve } from "node:path";
+import { appendFileSync, existsSync, mkdirSync, readFileSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { dirname, resolve } from "node:path";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import sql from "mssql";
@@ -11,6 +12,8 @@ const WRITE_QUERY_PATTERN =
 const READ_QUERY_PATTERN = /^(select|with)\b/i;
 
 loadEnvFile(".env");
+
+type LogLevel = "INFO" | "WARN" | "ERROR";
 
 type ConnectionTarget = {
   name: string;
@@ -30,6 +33,18 @@ type TargetConfigFile = {
   defaultTarget?: string | null;
   targets: ConnectionTarget[];
 };
+
+type Logger = {
+  logFilePath: string;
+  write: (level: LogLevel, event: string, data?: Record<string, unknown>) => void;
+  info: (event: string, data?: Record<string, unknown>) => void;
+  warn: (event: string, data?: Record<string, unknown>) => void;
+  error: (event: string, data?: Record<string, unknown>) => void;
+};
+
+const logger = createLogger(
+  process.env.MSSQL_MCP_LOG_FILE?.trim() || "./logs/mssql-mcp.log.jsonl"
+);
 
 function loadEnvFile(fileName: string): void {
   const filePath = resolve(process.cwd(), fileName);
@@ -83,6 +98,35 @@ function requireEnv(name: string): string {
   }
 
   return value;
+}
+
+function createLogger(logFilePath: string): Logger {
+  const resolvedPath = resolve(process.cwd(), logFilePath);
+  mkdirSync(dirname(resolvedPath), { recursive: true });
+
+  const write = (level: LogLevel, event: string, data: Record<string, unknown> = {}) => {
+    const entry = JSON.stringify({
+      timestamp: new Date().toISOString(),
+      level,
+      event,
+      ...data
+    });
+
+    try {
+      appendFileSync(resolvedPath, `${entry}\n`, "utf8");
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      console.error(`Failed to write log entry: ${message}`);
+    }
+  };
+
+  return {
+    logFilePath: resolvedPath,
+    write,
+    info: (event, data) => write("INFO", event, data),
+    warn: (event, data) => write("WARN", event, data),
+    error: (event, data) => write("ERROR", event, data)
+  };
 }
 
 function ensureNonEmpty(value: string, label: string): string {
@@ -276,6 +320,40 @@ function formatRecordset(recordset: unknown): string {
   return JSON.stringify(recordset, null, 2);
 }
 
+function summarizeError(error: unknown): Record<string, unknown> {
+  if (error instanceof Error) {
+    return {
+      name: error.name,
+      message: error.message
+    };
+  }
+
+  return {
+    message: String(error)
+  };
+}
+
+function hashText(value: string): string {
+  return createHash("sha256").update(value).digest("hex");
+}
+
+function previewText(value: string, maxLength = 160): string {
+  return value.length <= maxLength ? value : `${value.slice(0, maxLength)}…`;
+}
+
+function buildQueryAudit(query: string): Record<string, unknown> {
+  const normalizedQuery = normalizeQuery(query);
+
+  return {
+    queryHash: hashText(normalizedQuery),
+    queryPreview: previewText(normalizedQuery)
+  };
+}
+
+function countRows(recordset: unknown): number | null {
+  return Array.isArray(recordset) ? recordset.length : null;
+}
+
 function buildInstructions(
   targets: ConnectionTarget[],
   defaultTarget?: string | null
@@ -299,6 +377,17 @@ async function main(): Promise<void> {
   const config = loadTargets();
   const targetMap = new Map(config.targets.map((target) => [target.name, target]));
   const poolCache = new Map<string, Promise<any>>();
+
+  logger.info("server.starting", {
+    logFilePath: logger.logFilePath,
+    targetCount: config.targets.length,
+    defaultTarget: config.defaultTarget ?? null,
+    targets: config.targets.map((target) => ({
+      name: target.name,
+      host: target.host,
+      defaultDatabase: target.defaultDatabase
+    }))
+  });
 
   const getTarget = (targetName?: string): ConnectionTarget => {
     const normalizedTargetName = targetName?.trim();
@@ -336,13 +425,66 @@ async function main(): Promise<void> {
       return existing;
     }
 
-    const poolPromise = Promise.resolve(createPool(target)).then(async (pool) => {
-      await pool.connect();
-      return pool;
+    logger.info("db.connecting", {
+      target: target.name,
+      host: target.host,
+      port: target.port ?? 1433,
+      defaultDatabase: target.defaultDatabase
     });
+
+    const poolPromise = Promise.resolve(createPool(target))
+      .then(async (pool) => {
+        await pool.connect();
+        logger.info("db.connected", {
+          target: target.name,
+          host: target.host,
+          port: target.port ?? 1433,
+          defaultDatabase: target.defaultDatabase
+        });
+        return pool;
+      })
+      .catch((error) => {
+        poolCache.delete(target.name);
+        logger.error("db.connection_failed", {
+          target: target.name,
+          host: target.host,
+          port: target.port ?? 1433,
+          defaultDatabase: target.defaultDatabase,
+          error: summarizeError(error)
+        });
+        throw error;
+      });
 
     poolCache.set(target.name, poolPromise);
     return poolPromise;
+  };
+
+  const executeAudited = async <T>(
+    toolName: string,
+    context: Record<string, unknown>,
+    action: () => Promise<{ response: T; audit?: Record<string, unknown> }>
+  ): Promise<T> => {
+    const startedAt = Date.now();
+    logger.info("tool.started", { tool: toolName, ...context });
+
+    try {
+      const { response, audit } = await action();
+      logger.info("tool.succeeded", {
+        tool: toolName,
+        durationMs: Date.now() - startedAt,
+        ...context,
+        ...audit
+      });
+      return response;
+    } catch (error) {
+      logger.error("tool.failed", {
+        tool: toolName,
+        durationMs: Date.now() - startedAt,
+        ...context,
+        error: summarizeError(error)
+      });
+      throw error;
+    }
   };
 
   const server = new McpServer(
@@ -367,23 +509,32 @@ async function main(): Promise<void> {
       }
     },
     async () => {
-      return {
-        content: [
-          {
-            type: "text",
-            text: formatRecordset({
-              defaultTarget: config.defaultTarget ?? null,
-              targets: config.targets.map((target) => ({
-                name: target.name,
-                description: target.description,
-                host: target.host,
-                defaultDatabase: target.defaultDatabase,
-                port: target.port ?? 1433
-              }))
-            })
+      return executeAudited("list_targets", {}, async () => {
+        const payload = {
+          defaultTarget: config.defaultTarget ?? null,
+          targets: config.targets.map((target) => ({
+            name: target.name,
+            description: target.description,
+            host: target.host,
+            defaultDatabase: target.defaultDatabase,
+            port: target.port ?? 1433
+          }))
+        };
+
+        return {
+          response: {
+            content: [
+              {
+                type: "text" as const,
+                text: formatRecordset(payload)
+              }
+            ]
+          },
+          audit: {
+            targetCount: config.targets.length
           }
-        ]
-      };
+        };
+      });
     }
   );
 
@@ -404,29 +555,40 @@ async function main(): Promise<void> {
     },
     async ({ target }) => {
       const selectedTarget = getTarget(target);
-      const pool = await getPool(selectedTarget.name);
-      const result = await pool.request().query(`
-        SELECT
-          name,
-          database_id,
-          create_date,
-          compatibility_level,
-          state_desc
-        FROM sys.databases
-        ORDER BY name
-      `);
+      return executeAudited(
+        "list_databases",
+        { target: selectedTarget.name },
+        async () => {
+          const pool = await getPool(selectedTarget.name);
+          const result = await pool.request().query(`
+            SELECT
+              name,
+              database_id,
+              create_date,
+              compatibility_level,
+              state_desc
+            FROM sys.databases
+            ORDER BY name
+          `);
 
-      return {
-        content: [
-          {
-            type: "text",
-            text: formatRecordset({
-              target: selectedTarget.name,
-              databases: result.recordset
-            })
-          }
-        ]
-      };
+          return {
+            response: {
+              content: [
+                {
+                  type: "text" as const,
+                  text: formatRecordset({
+                    target: selectedTarget.name,
+                    databases: result.recordset
+                  })
+                }
+              ]
+            },
+            audit: {
+              rowCount: countRows(result.recordset)
+            }
+          };
+        }
+      );
     }
   );
 
@@ -449,35 +611,50 @@ async function main(): Promise<void> {
     },
     async ({ target, database, schema }) => {
       const selectedTarget = getTarget(target);
-      const pool = await getPool(selectedTarget.name);
-      const databaseName = quoteSqlIdentifier(database, "Database name");
-      const result = await pool
-        .request()
-        .input("schema", sql.NVarChar, schema?.trim() || null)
-        .query(`
-          SELECT
-            TABLE_CATALOG,
-            TABLE_SCHEMA,
-            TABLE_NAME
-          FROM ${databaseName}.INFORMATION_SCHEMA.TABLES
-          WHERE TABLE_TYPE = 'BASE TABLE'
-            AND (@schema IS NULL OR TABLE_SCHEMA = @schema)
-          ORDER BY TABLE_SCHEMA, TABLE_NAME
-        `);
+      return executeAudited(
+        "list_tables",
+        {
+          target: selectedTarget.name,
+          database: database.trim(),
+          schema: schema?.trim() || null
+        },
+        async () => {
+          const pool = await getPool(selectedTarget.name);
+          const databaseName = quoteSqlIdentifier(database, "Database name");
+          const result = await pool
+            .request()
+            .input("schema", sql.NVarChar, schema?.trim() || null)
+            .query(`
+              SELECT
+                TABLE_CATALOG,
+                TABLE_SCHEMA,
+                TABLE_NAME
+              FROM ${databaseName}.INFORMATION_SCHEMA.TABLES
+              WHERE TABLE_TYPE = 'BASE TABLE'
+                AND (@schema IS NULL OR TABLE_SCHEMA = @schema)
+              ORDER BY TABLE_SCHEMA, TABLE_NAME
+            `);
 
-      return {
-        content: [
-          {
-            type: "text",
-            text: formatRecordset({
-              target: selectedTarget.name,
-              database: database.trim(),
-              schema: schema?.trim() || null,
-              tables: result.recordset
-            })
-          }
-        ]
-      };
+          return {
+            response: {
+              content: [
+                {
+                  type: "text" as const,
+                  text: formatRecordset({
+                    target: selectedTarget.name,
+                    database: database.trim(),
+                    schema: schema?.trim() || null,
+                    tables: result.recordset
+                  })
+                }
+              ]
+            },
+            audit: {
+              rowCount: countRows(result.recordset)
+            }
+          };
+        }
+      );
     }
   );
 
@@ -501,48 +678,66 @@ async function main(): Promise<void> {
     },
     async ({ target, database, table, schema }) => {
       const selectedTarget = getTarget(target);
-      const pool = await getPool(selectedTarget.name);
-      const databaseName = quoteSqlIdentifier(database, "Database name");
       const { schemaName, tableName } = parseTableReference(table, schema);
-      const result = await pool
-        .request()
-        .input("schema", sql.NVarChar, schemaName)
-        .input("table", sql.NVarChar, tableName)
-        .query(`
-          SELECT
-            TABLE_CATALOG,
-            TABLE_SCHEMA,
-            TABLE_NAME,
-            COLUMN_NAME,
-            DATA_TYPE,
-            IS_NULLABLE,
-            CHARACTER_MAXIMUM_LENGTH,
-            NUMERIC_PRECISION,
-            NUMERIC_SCALE
-          FROM ${databaseName}.INFORMATION_SCHEMA.COLUMNS
-          WHERE TABLE_SCHEMA = @schema
-            AND TABLE_NAME = @table
-          ORDER BY ORDINAL_POSITION
-        `);
+      return executeAudited(
+        "describe_table",
+        {
+          target: selectedTarget.name,
+          database: database.trim(),
+          schema: schemaName,
+          table: tableName
+        },
+        async () => {
+          const pool = await getPool(selectedTarget.name);
+          const databaseName = quoteSqlIdentifier(database, "Database name");
+          const result = await pool
+            .request()
+            .input("schema", sql.NVarChar, schemaName)
+            .input("table", sql.NVarChar, tableName)
+            .query(`
+              SELECT
+                TABLE_CATALOG,
+                TABLE_SCHEMA,
+                TABLE_NAME,
+                COLUMN_NAME,
+                DATA_TYPE,
+                IS_NULLABLE,
+                CHARACTER_MAXIMUM_LENGTH,
+                NUMERIC_PRECISION,
+                NUMERIC_SCALE
+              FROM ${databaseName}.INFORMATION_SCHEMA.COLUMNS
+              WHERE TABLE_SCHEMA = @schema
+                AND TABLE_NAME = @table
+              ORDER BY ORDINAL_POSITION
+            `);
 
-      if (result.recordset.length === 0) {
-        throw new Error(`Table not found: ${database.trim()}.${schemaName}.${tableName}`);
-      }
-
-      return {
-        content: [
-          {
-            type: "text",
-            text: formatRecordset({
-              target: selectedTarget.name,
-              database: database.trim(),
-              schema: schemaName,
-              table: tableName,
-              columns: result.recordset
-            })
+          if (result.recordset.length === 0) {
+            throw new Error(
+              `Table not found: ${database.trim()}.${schemaName}.${tableName}`
+            );
           }
-        ]
-      };
+
+          return {
+            response: {
+              content: [
+                {
+                  type: "text" as const,
+                  text: formatRecordset({
+                    target: selectedTarget.name,
+                    database: database.trim(),
+                    schema: schemaName,
+                    table: tableName,
+                    columns: result.recordset
+                  })
+                }
+              ]
+            },
+            audit: {
+              rowCount: countRows(result.recordset)
+            }
+          };
+        }
+      );
     }
   );
 
@@ -564,47 +759,80 @@ async function main(): Promise<void> {
     },
     async ({ target, sql: query }) => {
       const selectedTarget = getTarget(target);
-      const pool = await getPool(selectedTarget.name);
-      assertReadOnlyQuery(query);
+      const queryAudit = buildQueryAudit(query);
+      return executeAudited(
+        "query_sql",
+        {
+          target: selectedTarget.name,
+          ...queryAudit
+        },
+        async () => {
+          const pool = await getPool(selectedTarget.name);
 
-      const result = await pool.request().query(query);
-
-      return {
-        content: [
-          {
-            type: "text",
-            text: formatRecordset({
+          try {
+            assertReadOnlyQuery(query);
+          } catch (error) {
+            logger.warn("security.query_blocked", {
               target: selectedTarget.name,
-              rows: result.recordset
-            })
+              ...queryAudit,
+              error: summarizeError(error)
+            });
+            throw error;
           }
-        ]
-      };
+
+          const result = await pool.request().query(query);
+
+          return {
+            response: {
+              content: [
+                {
+                  type: "text" as const,
+                  text: formatRecordset({
+                    target: selectedTarget.name,
+                    rows: result.recordset
+                  })
+                }
+              ]
+            },
+            audit: {
+              rowCount: countRows(result.recordset)
+            }
+          };
+        }
+      );
     }
   );
 
   const shutdown = async (): Promise<void> => {
+    logger.info("server.shutdown_started");
     await server.close().catch(() => undefined);
     await Promise.all(
       [...poolCache.values()].map(async (poolPromise) =>
         poolPromise.then((pool) => pool.close()).catch(() => undefined)
       )
     );
+    logger.info("server.shutdown_completed");
   };
 
   process.once("SIGINT", () => {
+    logger.warn("server.signal_received", { signal: "SIGINT" });
     void shutdown().finally(() => process.exit(0));
   });
 
   process.once("SIGTERM", () => {
+    logger.warn("server.signal_received", { signal: "SIGTERM" });
     void shutdown().finally(() => process.exit(0));
   });
 
   const transport = new StdioServerTransport();
   await server.connect(transport);
+  logger.info("server.ready");
 }
 
 main().catch((error: unknown) => {
+  logger.error("server.startup_failed", {
+    error: summarizeError(error)
+  });
   const message = error instanceof Error ? error.message : String(error);
   console.error(`Failed to start mssql MCP server: ${message}`);
   process.exit(1);
