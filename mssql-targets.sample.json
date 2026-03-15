@@ -1,0 +1,29 @@
+{
+  "defaultTarget": "app",
+  "targets": [
+    {
+      "name": "app",
+      "description": "Primary application database server. Use for users, orders, subscriptions, and product data.",
+      "host": "192.168.0.20",
+      "user": "sa",
+      "password": "replace-me",
+      "defaultDatabase": "master",
+      "options": {
+        "encrypt": false,
+        "trustServerCertificate": true
+      }
+    },
+    {
+      "name": "analytics",
+      "description": "Reporting and BI server. Use for dashboards, aggregated metrics, ETL outputs, and historical analysis.",
+      "host": "192.168.0.30",
+      "user": "report_user",
+      "password": "replace-me",
+      "defaultDatabase": "master",
+      "options": {
+        "encrypt": false,
+        "trustServerCertificate": true
+      }
+    }
+  ]
+}

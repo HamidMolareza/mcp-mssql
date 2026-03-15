@@ -12,6 +12,25 @@ const READ_QUERY_PATTERN = /^(select|with)\b/i;
 
 loadEnvFile(".env");
 
+type ConnectionTarget = {
+  name: string;
+  description: string;
+  host: string;
+  user: string;
+  password: string;
+  defaultDatabase: string;
+  port?: number;
+  options?: {
+    encrypt?: boolean;
+    trustServerCertificate?: boolean;
+  };
+};
+
+type TargetConfigFile = {
+  defaultTarget?: string;
+  targets: ConnectionTarget[];
+};
+
 function loadEnvFile(fileName: string): void {
   const filePath = resolve(process.cwd(), fileName);
 
@@ -66,17 +85,116 @@ function requireEnv(name: string): string {
   return value;
 }
 
-function createPool() {
+function ensureNonEmpty(value: string, label: string): string {
+  const trimmed = value.trim();
+
+  if (!trimmed) {
+    throw new Error(`${label} is required.`);
+  }
+
+  return trimmed;
+}
+
+function createPool(target: ConnectionTarget) {
   return new sql.ConnectionPool({
-    user: requireEnv("DB_USER"),
-    password: requireEnv("DB_PASSWORD"),
-    server: requireEnv("DB_HOST"),
-    database: requireEnv("DB_NAME"),
+    user: target.user,
+    password: target.password,
+    server: target.host,
+    port: target.port,
+    database: target.defaultDatabase,
     options: {
-      encrypt: false,
-      trustServerCertificate: true
+      encrypt: target.options?.encrypt ?? false,
+      trustServerCertificate: target.options?.trustServerCertificate ?? true
     }
   });
+}
+
+function loadTargets(): TargetConfigFile {
+  const targetsFile = process.env.MSSQL_TARGETS_FILE?.trim();
+
+  if (targetsFile) {
+    const filePath = resolve(process.cwd(), targetsFile);
+
+    if (!existsSync(filePath)) {
+      throw new Error(`Targets file not found: ${filePath}`);
+    }
+
+    const parsed = JSON.parse(readFileSync(filePath, "utf8")) as Partial<TargetConfigFile>;
+    const targets = (parsed.targets ?? []).map(normalizeTarget);
+
+    if (targets.length === 0) {
+      throw new Error("Targets file must include at least one target.");
+    }
+
+    if (
+      parsed.defaultTarget &&
+      !targets.some((target) => target.name === parsed.defaultTarget)
+    ) {
+      throw new Error(`Unknown defaultTarget: ${parsed.defaultTarget}`);
+    }
+
+    return parsed.defaultTarget
+      ? {
+          defaultTarget: parsed.defaultTarget,
+          targets
+        }
+      : {
+          targets
+        };
+  }
+
+  return {
+    defaultTarget: "default",
+    targets: [
+      normalizeTarget({
+        name: "default",
+        description:
+          process.env.DB_DESCRIPTION?.trim() ||
+          "Default SQL Server target loaded from DB_* environment variables.",
+        host: requireEnv("DB_HOST"),
+        user: requireEnv("DB_USER"),
+        password: requireEnv("DB_PASSWORD"),
+        defaultDatabase: requireEnv("DB_NAME")
+      })
+    ]
+  };
+}
+
+function normalizeTarget(input: Partial<ConnectionTarget>): ConnectionTarget {
+  const name = ensureNonEmpty(input.name ?? "", "Target name");
+
+  if (!SQL_IDENTIFIER.test(name)) {
+    throw new Error(`Invalid target name: ${name}`);
+  }
+
+  const normalizedTarget: ConnectionTarget = {
+    name,
+    description: ensureNonEmpty(
+      input.description ?? "",
+      `Description for target ${name}`
+    ),
+    host: ensureNonEmpty(input.host ?? "", `Host for target ${name}`),
+    user: ensureNonEmpty(input.user ?? "", `User for target ${name}`),
+    password: ensureNonEmpty(input.password ?? "", `Password for target ${name}`),
+    defaultDatabase: ensureNonEmpty(
+      input.defaultDatabase ?? "",
+      `Default database for target ${name}`
+    ),
+    options: {
+      encrypt: input.options?.encrypt ?? false,
+      trustServerCertificate: input.options?.trustServerCertificate ?? true
+    }
+  };
+
+  if (input.port !== undefined) {
+    if (!Number.isInteger(input.port) || input.port <= 0) {
+      throw new Error(`Invalid port for target ${name}`);
+    }
+
+    normalizedTarget.port = input.port;
+  }
+
+  return normalizedTarget;
 }
 
 function quoteSqlIdentifier(identifier: string, label: string): string {
@@ -157,31 +275,132 @@ function formatRecordset(recordset: unknown): string {
   return JSON.stringify(recordset, null, 2);
 }
 
+function buildInstructions(targets: ConnectionTarget[], defaultTarget?: string): string {
+  const lines = [
+    "Use the SQL Server tools with the `target` argument to choose the correct server.",
+    "If the task does not specify a target, choose based on the descriptions below."
+  ];
+
+  for (const target of targets) {
+    const defaultSuffix = target.name === defaultTarget ? " (default target)" : "";
+    lines.push(
+      `- ${target.name}${defaultSuffix}: ${target.description}. Host: ${target.host}. Default database: ${target.defaultDatabase}.`
+    );
+  }
+
+  return lines.join("\n");
+}
+
 async function main(): Promise<void> {
-  const pool = createPool();
-  await pool.connect();
+  const config = loadTargets();
+  const targetMap = new Map(config.targets.map((target) => [target.name, target]));
+  const poolCache = new Map<string, Promise<any>>();
+
+  const getTarget = (targetName?: string): ConnectionTarget => {
+    const normalizedTargetName = targetName?.trim();
+
+    if (normalizedTargetName) {
+      const target = targetMap.get(normalizedTargetName);
+
+      if (!target) {
+        throw new Error(`Unknown target: ${normalizedTargetName}`);
+      }
+
+      return target;
+    }
+
+    if (config.defaultTarget) {
+      const defaultTarget = targetMap.get(config.defaultTarget);
+
+      if (defaultTarget) {
+        return defaultTarget;
+      }
+    }
+
+    if (config.targets.length === 1) {
+      return config.targets[0]!;
+    }
+
+    throw new Error("Multiple targets are configured. Specify the `target` argument.");
+  };
+
+  const getPool = async (targetName?: string) => {
+    const target = getTarget(targetName);
+    const existing = poolCache.get(target.name);
+
+    if (existing) {
+      return existing;
+    }
+
+    const poolPromise = Promise.resolve(createPool(target)).then(async (pool) => {
+      await pool.connect();
+      return pool;
+    });
+
+    poolCache.set(target.name, poolPromise);
+    return poolPromise;
+  };
 
   const server = new McpServer(
     {
       name: "mssql-mcp-server",
-      version: "1.2.0"
+      version: "1.3.0"
     },
     {
       capabilities: {
         tools: {}
+      },
+      instructions: buildInstructions(config.targets, config.defaultTarget)
+    }
+  );
+
+  server.registerTool(
+    "list_targets",
+    {
+      description: "List configured SQL Server targets and when each should be used.",
+      annotations: {
+        readOnlyHint: true
       }
+    },
+    async () => {
+      return {
+        content: [
+          {
+            type: "text",
+            text: formatRecordset({
+              defaultTarget: config.defaultTarget ?? null,
+              targets: config.targets.map((target) => ({
+                name: target.name,
+                description: target.description,
+                host: target.host,
+                defaultDatabase: target.defaultDatabase,
+                port: target.port ?? 1433
+              }))
+            })
+          }
+        ]
+      };
     }
   );
 
   server.registerTool(
     "list_databases",
     {
-      description: "List databases available on the SQL Server instance.",
+      description: "List databases available on a SQL Server target.",
+      inputSchema: {
+        target: z
+          .string()
+          .min(1)
+          .optional()
+          .describe("Connection target name. Required when multiple targets are configured.")
+      },
       annotations: {
         readOnlyHint: true
       }
     },
-    async () => {
+    async ({ target }) => {
+      const selectedTarget = getTarget(target);
+      const pool = await getPool(selectedTarget.name);
       const result = await pool.request().query(`
         SELECT
           name,
@@ -197,7 +416,10 @@ async function main(): Promise<void> {
         content: [
           {
             type: "text",
-            text: formatRecordset(result.recordset)
+            text: formatRecordset({
+              target: selectedTarget.name,
+              databases: result.recordset
+            })
           }
         ]
       };
@@ -209,6 +431,11 @@ async function main(): Promise<void> {
     {
       description: "List base tables in the selected database, optionally filtered by schema.",
       inputSchema: {
+        target: z
+          .string()
+          .min(1)
+          .optional()
+          .describe("Connection target name. Required when multiple targets are configured."),
         database: z.string().min(1).describe("Database name"),
         schema: z.string().min(1).optional().describe("Optional schema filter")
       },
@@ -216,7 +443,9 @@ async function main(): Promise<void> {
         readOnlyHint: true
       }
     },
-    async ({ database, schema }) => {
+    async ({ target, database, schema }) => {
+      const selectedTarget = getTarget(target);
+      const pool = await getPool(selectedTarget.name);
       const databaseName = quoteSqlIdentifier(database, "Database name");
       const result = await pool
         .request()
@@ -237,6 +466,7 @@ async function main(): Promise<void> {
           {
             type: "text",
             text: formatRecordset({
+              target: selectedTarget.name,
               database: database.trim(),
               schema: schema?.trim() || null,
               tables: result.recordset
@@ -252,6 +482,11 @@ async function main(): Promise<void> {
     {
       description: "Describe a table in a selected database.",
       inputSchema: {
+        target: z
+          .string()
+          .min(1)
+          .optional()
+          .describe("Connection target name. Required when multiple targets are configured."),
         database: z.string().min(1).describe("Database name"),
         table: z.string().min(1).describe("Table name or schema-qualified table name"),
         schema: z.string().min(1).optional().describe("Optional schema when `table` is not qualified")
@@ -260,7 +495,9 @@ async function main(): Promise<void> {
         readOnlyHint: true
       }
     },
-    async ({ database, table, schema }) => {
+    async ({ target, database, table, schema }) => {
+      const selectedTarget = getTarget(target);
+      const pool = await getPool(selectedTarget.name);
       const databaseName = quoteSqlIdentifier(database, "Database name");
       const { schemaName, tableName } = parseTableReference(table, schema);
       const result = await pool
@@ -293,6 +530,7 @@ async function main(): Promise<void> {
           {
             type: "text",
             text: formatRecordset({
+              target: selectedTarget.name,
               database: database.trim(),
               schema: schemaName,
               table: tableName,
@@ -309,13 +547,20 @@ async function main(): Promise<void> {
     {
       description: "Run a read-only SQL query (SELECT/CTE only).",
       inputSchema: {
+        target: z
+          .string()
+          .min(1)
+          .optional()
+          .describe("Connection target name. Required when multiple targets are configured."),
         sql: z.string().min(1).describe("Read-only SQL query")
       },
       annotations: {
         readOnlyHint: true
       }
     },
-    async ({ sql: query }) => {
+    async ({ target, sql: query }) => {
+      const selectedTarget = getTarget(target);
+      const pool = await getPool(selectedTarget.name);
       assertReadOnlyQuery(query);
 
       const result = await pool.request().query(query);
@@ -324,7 +569,10 @@ async function main(): Promise<void> {
         content: [
           {
             type: "text",
-            text: formatRecordset(result.recordset)
+            text: formatRecordset({
+              target: selectedTarget.name,
+              rows: result.recordset
+            })
           }
         ]
       };
@@ -333,7 +581,11 @@ async function main(): Promise<void> {
 
   const shutdown = async (): Promise<void> => {
     await server.close().catch(() => undefined);
-    await pool.close().catch(() => undefined);
+    await Promise.all(
+      [...poolCache.values()].map(async (poolPromise) =>
+        poolPromise.then((pool) => pool.close()).catch(() => undefined)
+      )
+    );
   };
 
   process.once("SIGINT", () => {
