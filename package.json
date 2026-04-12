@@ -5,11 +5,14 @@
   "main": "dist/server.js",
   "scripts": {
     "build": "tsc -p tsconfig.json",
-    "check": "tsc --noEmit",
+    "check": "npm run check:src && npm run check:test",
     "start": "npm run build && node dist/server.js",
     "dev": "node --loader ts-node/esm src/server.ts",
     "test": "tsx --test tests/**/*.test.ts",
-    "test:watch": "tsx --test --watch tests/**/*.test.ts"
+    "test:watch": "tsx --test --watch tests/**/*.test.ts",
+    "check:src": "tsc --noEmit -p tsconfig.json",
+    "check:test": "tsc --noEmit -p tsconfig.test.json",
+    "ci": "npm run check && npm test && npm run build"
   },
   "keywords": [],
   "author": "",

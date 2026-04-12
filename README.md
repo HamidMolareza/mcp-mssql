@@ -30,6 +30,38 @@ npm install
 npm run build
 ```
 
+## Scripts
+
+```bash
+npm run dev
+npm run build
+npm run check
+npm run test
+npm run test:watch
+npm run ci
+```
+
+`npm run check` type-checks both source files and tests.
+
+## Project structure
+
+```text
+src/
+  app/
+  config/
+  logging/
+  shared/
+  sql/
+  tools/
+  server.ts
+tests/
+  unit/
+docs/
+  architecture.md
+```
+
+See `docs/architecture.md` for the refactor boundaries and maintenance rules.
+
 ## Configuration
 
 You can configure this server in two ways:
@@ -92,6 +124,8 @@ DB_DESCRIPTION=Primary SQL Server target for application data
 MSSQL_MCP_LOG_FILE=./logs/mssql-mcp.log.jsonl
 ```
 
+You can copy from `.env.sample` as a starting point.
+
 ## Logging
 
 Logs are written in JSON Lines format.
@@ -106,7 +140,7 @@ Logged events include:
 
 - server startup and shutdown
 - database connection attempts
-- tool start/success/failure
+- tool start, success, and failure
 - blocked unsafe SQL queries
 - startup and runtime errors
 
@@ -115,7 +149,29 @@ Logged events include:
 - a SHA-256 hash of the normalized query
 - a short query preview
 
-This helps with audit and debugging without blindly dumping full SQL into logs.
+This helps with audit and debugging without dumping full SQL into logs.
+
+## Testing strategy
+
+The test suite currently focuses on:
+
+- pure helpers for env parsing, target normalization, SQL validation, and formatting
+- runtime behavior for target selection and pool caching
+- tool handlers with mocked `mssql` pools so refactors do not change MCP responses by accident
+
+Run locally with:
+
+```bash
+npm run check
+npm run test
+npm run build
+```
+
+Or run everything with:
+
+```bash
+npm run ci
+```
 
 ## Running locally
 
@@ -241,7 +297,9 @@ Run a read-only query:
 
 ## Files
 
-- `src/server.ts`: MCP server implementation
+- `src/server.ts`: bootstrap entrypoint
+- `src/app/runtime.ts`: target resolution and pool lifecycle
+- `src/tools/`: MCP tool handlers and registration
+- `tests/unit/`: regression-focused unit tests
+- `.env.sample`: sample legacy single-target config
 - `mssql-targets.sample.json`: sample multi-target config
-- `.env.sample`: sample env config
-
