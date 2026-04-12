@@ -1,15 +1,23 @@
-import { formatRecordset, countRows } from "../shared/format.js";
 import type { AppRuntime, ToolResponse } from "../shared/types.js";
+import {
+  createRowCountAudit,
+  createTextResponse,
+  executeTargetedTool,
+  type TargetedToolArgs
+} from "./common.js";
 
 export function buildListDatabasesHandler(
   runtime: AppRuntime
-): (args: { target?: string | undefined }) => Promise<ToolResponse> {
+): (args: TargetedToolArgs) => Promise<ToolResponse> {
   return async ({ target }) => {
-    const selectedTarget = runtime.getTarget(target);
-
-    return runtime.executeAudited("list_databases", { target: selectedTarget.name }, async () => {
-      const pool = await runtime.getPool(selectedTarget.name);
-      const result = await pool.request().query(`
+    return executeTargetedTool(
+      runtime,
+      "list_databases",
+      target,
+      (selectedTarget) => ({ target: selectedTarget.name }),
+      async ({ selectedTarget }) => {
+        const pool = await runtime.getPool(selectedTarget.name);
+        const result = await pool.request().query(`
         SELECT
           name,
           database_id,
@@ -20,22 +28,14 @@ export function buildListDatabasesHandler(
         ORDER BY name
       `);
 
-      return {
-        response: {
-          content: [
-            {
-              type: "text",
-              text: formatRecordset({
-                target: selectedTarget.name,
-                databases: result.recordset
-              })
-            }
-          ]
-        },
-        audit: {
-          rowCount: countRows(result.recordset)
-        }
-      };
-    });
+        return {
+          response: createTextResponse({
+            target: selectedTarget.name,
+            databases: result.recordset
+          }),
+          audit: createRowCountAudit(result.recordset)
+        };
+      }
+    );
   };
 }

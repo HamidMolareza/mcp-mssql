@@ -1,26 +1,39 @@
 import sql from "mssql";
-import { countRows, formatRecordset } from "../shared/format.js";
 import type { AppRuntime, ToolResponse } from "../shared/types.js";
 import { parseTableReference, quoteSqlIdentifier } from "../sql/identifiers.js";
+import {
+  createRowCountAudit,
+  createTextResponse,
+  executeTargetedTool,
+  type TargetedToolArgs
+} from "./common.js";
+
+type DescribeTableArgs = TargetedToolArgs & {
+  database: string;
+  table: string;
+  schema?: string | undefined;
+};
 
 export function buildDescribeTableHandler(
   runtime: AppRuntime
-): (args: { target?: string | undefined; database: string; table: string; schema?: string | undefined }) => Promise<ToolResponse> {
+): (args: DescribeTableArgs) => Promise<ToolResponse> {
   return async ({ target, database, table, schema }) => {
-    const selectedTarget = runtime.getTarget(target);
+    const trimmedDatabase = database.trim();
     const { schemaName, tableName } = parseTableReference(table, schema);
 
-    return runtime.executeAudited(
+    return executeTargetedTool(
+      runtime,
       "describe_table",
-      {
+      target,
+      (selectedTarget) => ({
         target: selectedTarget.name,
-        database: database.trim(),
+        database: trimmedDatabase,
         schema: schemaName,
         table: tableName
-      },
-      async () => {
+      }),
+      async ({ selectedTarget }) => {
         const pool = await runtime.getPool(selectedTarget.name);
-        const databaseName = quoteSqlIdentifier(database, "Database name");
+        const databaseName = quoteSqlIdentifier(trimmedDatabase, "Database name");
         const result = await pool
           .request()
           .input("schema", sql.NVarChar, schemaName)
@@ -43,27 +56,18 @@ export function buildDescribeTableHandler(
           `);
 
         if (result.recordset.length === 0) {
-          throw new Error(`Table not found: ${database.trim()}.${schemaName}.${tableName}`);
+          throw new Error(`Table not found: ${trimmedDatabase}.${schemaName}.${tableName}`);
         }
 
         return {
-          response: {
-            content: [
-              {
-                type: "text",
-                text: formatRecordset({
-                  target: selectedTarget.name,
-                  database: database.trim(),
-                  schema: schemaName,
-                  table: tableName,
-                  columns: result.recordset
-                })
-              }
-            ]
-          },
-          audit: {
-            rowCount: countRows(result.recordset)
-          }
+          response: createTextResponse({
+            target: selectedTarget.name,
+            database: trimmedDatabase,
+            schema: schemaName,
+            table: tableName,
+            columns: result.recordset
+          }),
+          audit: createRowCountAudit(result.recordset)
         };
       }
     );

@@ -1,5 +1,5 @@
-import { formatRecordset } from "../shared/format.js";
 import type { AppRuntime, ToolResponse } from "../shared/types.js";
+import { createTextResponse } from "./common.js";
 
 export function buildListTargetsHandler(runtime: AppRuntime): () => Promise<ToolResponse> {
   return async () => {
@@ -16,14 +16,7 @@ export function buildListTargetsHandler(runtime: AppRuntime): () => Promise<Tool
       };
 
       return {
-        response: {
-          content: [
-            {
-              type: "text",
-              text: formatRecordset(payload)
-            }
-          ]
-        },
+        response: createTextResponse(payload),
         audit: {
           targetCount: runtime.config.targets.length
         }

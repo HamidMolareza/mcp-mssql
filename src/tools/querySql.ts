@@ -1,21 +1,32 @@
-import { buildQueryAudit, countRows, formatRecordset, summarizeError } from "../shared/format.js";
+import { buildQueryAudit, summarizeError } from "../shared/format.js";
 import type { AppRuntime, ToolResponse } from "../shared/types.js";
 import { assertReadOnlyQuery } from "../sql/safety.js";
+import {
+  createRowCountAudit,
+  createTextResponse,
+  executeTargetedTool,
+  type TargetedToolArgs
+} from "./common.js";
+
+type QuerySqlArgs = TargetedToolArgs & {
+  sql: string;
+};
 
 export function buildQuerySqlHandler(
   runtime: AppRuntime
-): (args: { target?: string | undefined; sql: string }) => Promise<ToolResponse> {
+): (args: QuerySqlArgs) => Promise<ToolResponse> {
   return async ({ target, sql: query }) => {
-    const selectedTarget = runtime.getTarget(target);
     const queryAudit = buildQueryAudit(query);
 
-    return runtime.executeAudited(
+    return executeTargetedTool(
+      runtime,
       "query_sql",
-      {
+      target,
+      (selectedTarget) => ({
         target: selectedTarget.name,
         ...queryAudit
-      },
-      async () => {
+      }),
+      async ({ selectedTarget }) => {
         const pool = await runtime.getPool(selectedTarget.name);
 
         try {
@@ -32,20 +43,11 @@ export function buildQuerySqlHandler(
         const result = await pool.request().query(query);
 
         return {
-          response: {
-            content: [
-              {
-                type: "text",
-                text: formatRecordset({
-                  target: selectedTarget.name,
-                  rows: result.recordset
-                })
-              }
-            ]
-          },
-          audit: {
-            rowCount: countRows(result.recordset)
-          }
+          response: createTextResponse({
+            target: selectedTarget.name,
+            rows: result.recordset
+          }),
+          audit: createRowCountAudit(result.recordset)
         };
       }
     );
