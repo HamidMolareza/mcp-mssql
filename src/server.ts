@@ -1,143 +1,20 @@
-import { appendFileSync, existsSync, mkdirSync, readFileSync } from "node:fs";
-import { createHash } from "node:crypto";
-import { dirname, resolve } from "node:path";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import sql from "mssql";
 import { z } from "zod";
-
-const SQL_IDENTIFIER = /^[A-Za-z_][A-Za-z0-9_@$#]*$/;
-const WRITE_QUERY_PATTERN =
-  /\b(insert|update|delete|drop|alter|truncate|create|merge|exec(?:ute)?|grant|revoke|deny)\b/i;
-const READ_QUERY_PATTERN = /^(select|with)\b/i;
+import { loadEnvFile } from "./config/env.js";
+import { loadTargets } from "./config/targets.js";
+import { createLogger } from "./logging/logger.js";
+import { buildQueryAudit, countRows, formatRecordset, summarizeError } from "./shared/format.js";
+import type { ConnectionTarget } from "./shared/types.js";
+import { parseTableReference, quoteSqlIdentifier } from "./sql/identifiers.js";
+import { assertReadOnlyQuery } from "./sql/safety.js";
 
 loadEnvFile(".env");
-
-type LogLevel = "INFO" | "WARN" | "ERROR";
-
-type ConnectionTarget = {
-  name: string;
-  description: string;
-  host: string;
-  user: string;
-  password: string;
-  defaultDatabase: string;
-  port?: number;
-  options?: {
-    encrypt?: boolean;
-    trustServerCertificate?: boolean;
-  };
-};
-
-type TargetConfigFile = {
-  defaultTarget?: string | null;
-  targets: ConnectionTarget[];
-};
-
-type Logger = {
-  logFilePath: string;
-  write: (level: LogLevel, event: string, data?: Record<string, unknown>) => void;
-  info: (event: string, data?: Record<string, unknown>) => void;
-  warn: (event: string, data?: Record<string, unknown>) => void;
-  error: (event: string, data?: Record<string, unknown>) => void;
-};
 
 const logger = createLogger(
   process.env.MSSQL_MCP_LOG_FILE?.trim() || "./logs/mssql-mcp.log.jsonl"
 );
-
-function loadEnvFile(fileName: string): void {
-  const filePath = resolve(process.cwd(), fileName);
-
-  if (!existsSync(filePath)) {
-    return;
-  }
-
-  const fileContents = readFileSync(filePath, "utf8");
-
-  for (const rawLine of fileContents.split(/\r?\n/u)) {
-    const line = rawLine.trim();
-
-    if (!line || line.startsWith("#")) {
-      continue;
-    }
-
-    const separatorIndex = line.indexOf("=");
-
-    if (separatorIndex <= 0) {
-      continue;
-    }
-
-    const key = line.slice(0, separatorIndex).trim();
-
-    if (!key || process.env[key] !== undefined) {
-      continue;
-    }
-
-    const value = line.slice(separatorIndex + 1).trim();
-    process.env[key] = stripOptionalQuotes(value);
-  }
-}
-
-function stripOptionalQuotes(value: string): string {
-  if (
-    (value.startsWith("\"") && value.endsWith("\"")) ||
-    (value.startsWith("'") && value.endsWith("'"))
-  ) {
-    return value.slice(1, -1);
-  }
-
-  return value;
-}
-
-function requireEnv(name: string): string {
-  const value = process.env[name]?.trim();
-
-  if (!value) {
-    throw new Error(`Missing required environment variable: ${name}`);
-  }
-
-  return value;
-}
-
-function createLogger(logFilePath: string): Logger {
-  const resolvedPath = resolve(process.cwd(), logFilePath);
-  mkdirSync(dirname(resolvedPath), { recursive: true });
-
-  const write = (level: LogLevel, event: string, data: Record<string, unknown> = {}) => {
-    const entry = JSON.stringify({
-      timestamp: new Date().toISOString(),
-      level,
-      event,
-      ...data
-    });
-
-    try {
-      appendFileSync(resolvedPath, `${entry}\n`, "utf8");
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      console.error(`Failed to write log entry: ${message}`);
-    }
-  };
-
-  return {
-    logFilePath: resolvedPath,
-    write,
-    info: (event, data) => write("INFO", event, data),
-    warn: (event, data) => write("WARN", event, data),
-    error: (event, data) => write("ERROR", event, data)
-  };
-}
-
-function ensureNonEmpty(value: string, label: string): string {
-  const trimmed = value.trim();
-
-  if (!trimmed) {
-    throw new Error(`${label} is required.`);
-  }
-
-  return trimmed;
-}
 
 function createPool(target: ConnectionTarget) {
   return new sql.ConnectionPool({
@@ -151,207 +28,6 @@ function createPool(target: ConnectionTarget) {
       trustServerCertificate: target.options?.trustServerCertificate ?? true
     }
   });
-}
-
-function loadTargets(): TargetConfigFile {
-  const targetsFile = process.env.MSSQL_TARGETS_FILE?.trim();
-
-  if (targetsFile) {
-    const filePath = resolve(process.cwd(), targetsFile);
-
-    if (!existsSync(filePath)) {
-      throw new Error(`Targets file not found: ${filePath}`);
-    }
-
-    const parsed = JSON.parse(readFileSync(filePath, "utf8")) as Partial<TargetConfigFile>;
-    const targets = (parsed.targets ?? []).map(normalizeTarget);
-
-    if (targets.length === 0) {
-      throw new Error("Targets file must include at least one target.");
-    }
-
-    if (
-      parsed.defaultTarget !== undefined &&
-      parsed.defaultTarget !== null &&
-      !targets.some((target) => target.name === parsed.defaultTarget)
-    ) {
-      throw new Error(`Unknown defaultTarget: ${parsed.defaultTarget}`);
-    }
-
-    return parsed.defaultTarget !== undefined
-      ? {
-          defaultTarget: parsed.defaultTarget,
-          targets
-        }
-      : {
-          targets
-        };
-  }
-
-  return {
-    defaultTarget: "default",
-    targets: [
-      normalizeTarget({
-        name: "default",
-        description:
-          process.env.DB_DESCRIPTION?.trim() ||
-          "Default SQL Server target loaded from DB_* environment variables.",
-        host: requireEnv("DB_HOST"),
-        user: requireEnv("DB_USER"),
-        password: requireEnv("DB_PASSWORD"),
-        defaultDatabase: requireEnv("DB_NAME")
-      })
-    ]
-  };
-}
-
-function normalizeTarget(input: Partial<ConnectionTarget>): ConnectionTarget {
-  const name = ensureNonEmpty(input.name ?? "", "Target name");
-
-  if (!SQL_IDENTIFIER.test(name)) {
-    throw new Error(`Invalid target name: ${name}`);
-  }
-
-  const normalizedTarget: ConnectionTarget = {
-    name,
-    description: ensureNonEmpty(
-      input.description ?? "",
-      `Description for target ${name}`
-    ),
-    host: ensureNonEmpty(input.host ?? "", `Host for target ${name}`),
-    user: ensureNonEmpty(input.user ?? "", `User for target ${name}`),
-    password: ensureNonEmpty(input.password ?? "", `Password for target ${name}`),
-    defaultDatabase: ensureNonEmpty(
-      input.defaultDatabase ?? "",
-      `Default database for target ${name}`
-    ),
-    options: {
-      encrypt: input.options?.encrypt ?? false,
-      trustServerCertificate: input.options?.trustServerCertificate ?? true
-    }
-  };
-
-  if (input.port !== undefined) {
-    if (!Number.isInteger(input.port) || input.port <= 0) {
-      throw new Error(`Invalid port for target ${name}`);
-    }
-
-    normalizedTarget.port = input.port;
-  }
-
-  return normalizedTarget;
-}
-
-function quoteSqlIdentifier(identifier: string, label: string): string {
-  const trimmed = identifier.trim();
-
-  if (!trimmed) {
-    throw new Error(`${label} is required.`);
-  }
-
-  if (trimmed.includes("\u0000")) {
-    throw new Error(`${label} contains invalid characters.`);
-  }
-
-  return `[${trimmed.replaceAll("]", "]]")}]`;
-}
-
-function parseTableReference(
-  tableReference: string,
-  schema?: string
-): { schemaName: string; tableName: string } {
-  const reference = tableReference.trim();
-
-  if (!reference) {
-    throw new Error("Table name is required.");
-  }
-
-  const segments = reference
-    .split(".")
-    .map((segment) => segment.trim())
-    .filter(Boolean);
-
-  if (segments.length === 0 || segments.length > 2) {
-    throw new Error("Use `table` or `schema.table` format.");
-  }
-
-  if (segments.length === 2 && schema?.trim()) {
-    throw new Error("Provide either `schema` or `schema.table`, not both.");
-  }
-
-  const schemaName =
-    segments.length === 2
-      ? (segments[0] ?? "").trim()
-      : (schema?.trim() || "dbo").trim();
-  const tableName = segments.at(-1)?.trim() ?? "";
-
-  if (!SQL_IDENTIFIER.test(schemaName) || !SQL_IDENTIFIER.test(tableName)) {
-    throw new Error("Schema and table names must be simple SQL identifiers.");
-  }
-
-  return { schemaName, tableName };
-}
-
-function normalizeQuery(query: string): string {
-  return query
-    .replace(/--.*$/gmu, "")
-    .replace(/\/\*[\s\S]*?\*\//gu, " ")
-    .replace(/^\s*;+/u, "")
-    .trim();
-}
-
-function assertReadOnlyQuery(query: string): void {
-  const normalizedQuery = normalizeQuery(query);
-
-  if (!normalizedQuery) {
-    throw new Error("SQL query cannot be empty.");
-  }
-
-  if (WRITE_QUERY_PATTERN.test(normalizedQuery)) {
-    throw new Error("Only read-only SQL statements are allowed.");
-  }
-
-  if (!READ_QUERY_PATTERN.test(normalizedQuery)) {
-    throw new Error("Query must start with SELECT or WITH.");
-  }
-}
-
-function formatRecordset(recordset: unknown): string {
-  return JSON.stringify(recordset, null, 2);
-}
-
-function summarizeError(error: unknown): Record<string, unknown> {
-  if (error instanceof Error) {
-    return {
-      name: error.name,
-      message: error.message
-    };
-  }
-
-  return {
-    message: String(error)
-  };
-}
-
-function hashText(value: string): string {
-  return createHash("sha256").update(value).digest("hex");
-}
-
-function previewText(value: string, maxLength = 160): string {
-  return value.length <= maxLength ? value : `${value.slice(0, maxLength)}…`;
-}
-
-function buildQueryAudit(query: string): Record<string, unknown> {
-  const normalizedQuery = normalizeQuery(query);
-
-  return {
-    queryHash: hashText(normalizedQuery),
-    queryPreview: previewText(normalizedQuery)
-  };
-}
-
-function countRows(recordset: unknown): number | null {
-  return Array.isArray(recordset) ? recordset.length : null;
 }
 
 function buildInstructions(
@@ -555,12 +231,9 @@ async function main(): Promise<void> {
     },
     async ({ target }) => {
       const selectedTarget = getTarget(target);
-      return executeAudited(
-        "list_databases",
-        { target: selectedTarget.name },
-        async () => {
-          const pool = await getPool(selectedTarget.name);
-          const result = await pool.request().query(`
+      return executeAudited("list_databases", { target: selectedTarget.name }, async () => {
+        const pool = await getPool(selectedTarget.name);
+        const result = await pool.request().query(`
             SELECT
               name,
               database_id,
@@ -571,24 +244,23 @@ async function main(): Promise<void> {
             ORDER BY name
           `);
 
-          return {
-            response: {
-              content: [
-                {
-                  type: "text" as const,
-                  text: formatRecordset({
-                    target: selectedTarget.name,
-                    databases: result.recordset
-                  })
-                }
-              ]
-            },
-            audit: {
-              rowCount: countRows(result.recordset)
-            }
-          };
-        }
-      );
+        return {
+          response: {
+            content: [
+              {
+                type: "text" as const,
+                text: formatRecordset({
+                  target: selectedTarget.name,
+                  databases: result.recordset
+                })
+              }
+            ]
+          },
+          audit: {
+            rowCount: countRows(result.recordset)
+          }
+        };
+      });
     }
   );
 

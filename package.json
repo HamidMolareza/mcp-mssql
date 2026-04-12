@@ -7,7 +7,9 @@
     "build": "tsc -p tsconfig.json",
     "check": "tsc --noEmit",
     "start": "npm run build && node dist/server.js",
-    "dev": "node --loader ts-node/esm src/server.ts"
+    "dev": "node --loader ts-node/esm src/server.ts",
+    "test": "tsx --test tests/**/*.test.ts",
+    "test:watch": "tsx --test --watch tests/**/*.test.ts"
   },
   "keywords": [],
   "author": "",
@@ -21,6 +23,7 @@
   "devDependencies": {
     "@types/node": "^25.5.0",
     "ts-node": "^10.9.2",
-    "typescript": "^5.9.3"
+    "typescript": "^5.9.3",
+    "tsx": "^4.20.5"
   }
 }
