@@ -35,12 +35,12 @@ async function main(): Promise<void> {
   };
 
   process.once("SIGINT", () => {
-    logger.warn("server.signal_received", { signal: "SIGINT" });
+    logger.info("server.signal_received", { signal: "SIGINT" });
     void shutdown().finally(() => process.exit(0));
   });
 
   process.once("SIGTERM", () => {
-    logger.warn("server.signal_received", { signal: "SIGTERM" });
+    logger.info("server.signal_received", { signal: "SIGTERM" });
     void shutdown().finally(() => process.exit(0));
   });
 
